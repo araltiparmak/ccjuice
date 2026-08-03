@@ -1,0 +1,39 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: ./build.sh
+      - name: Package app
+        run: ditto -c -k --keepParent CCJuice.app "CCJuice-${GITHUB_REF_NAME}.zip"
+      - name: Compute source tarball sha256 (for the Homebrew formula)
+        id: sha
+        run: |
+          curl -sL "https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz" -o src.tar.gz
+          echo "sha256=$(shasum -a 256 src.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: CCJuice-*.zip
+          body: |
+            ### Install
+
+            Build from source (recommended) or download `CCJuice-${{ github.ref_name }}.zip`.
+            The zip is unsigned — right-click the app and choose **Open** on first launch.
+
+            ### Homebrew formula values for this release
+
+            ```ruby
+            url "https://github.com/${{ github.repository }}/archive/refs/tags/${{ github.ref_name }}.tar.gz"
+            sha256 "${{ steps.sha.outputs.sha256 }}"
+            ```

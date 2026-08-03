@@ -1,0 +1,15 @@
+# Build artifacts (rebuilt by build.sh)
+CCJuice.app/
+CCJuice
+CCJuice-*.zip
+
+# Icon build intermediates (AppIcon.icns itself is tracked — build.sh needs it)
+AppIcon.iconset/
+icon-1024.png
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/

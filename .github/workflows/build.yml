@@ -1,0 +1,19 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: ./build.sh
+      - name: Verify bundle
+        run: |
+          test -x CCJuice.app/Contents/MacOS/CCJuice
+          test -f CCJuice.app/Contents/Resources/AppIcon.icns
+          codesign --verify CCJuice.app
