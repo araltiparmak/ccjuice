@@ -9,7 +9,8 @@ you have left — session (5-hour) and weekly — right next to the clock.
 
 <!-- ![Menu bar](docs/menubar.png) — add docs/menubar.png and uncomment -->
 
-Menu bar: `S58% W78%` (S = session, W = week, percent remaining).
+Menu bar: `S58% W78%` (S = session, W = week, percent remaining — switch to percent
+used under **Display**).
 
 ## Features
 
@@ -19,6 +20,7 @@ Menu bar: `S58% W78%` (S = session, W = week, percent remaining).
 - Optional notifications when usage runs low (threshold configurable: 10/20/30/50%)
   and when the session resets.
 - Display modes: both percentages, session only, week only, or only the lowest one.
+- Count either way: show what's **remaining** (default) or what's been **used**.
 - Start at Login toggle (macOS 13+), one-click jump to claude.ai usage settings.
 - Single Swift file, AppKit `NSStatusItem`, zero dependencies.
 - Refreshes every 5 minutes, on demand via **Refresh**, and immediately on wake
@@ -72,6 +74,17 @@ Swift — read `CCJuice.swift` and verify.
 
 - **`CC ⚠︎` in the menu bar** — open the menu; the error is on the first line.
 - **"Token expired"** — run Claude Code once; it refreshes the token.
+- **"Token lacks the user:profile scope"** — the usage endpoint requires the
+  `user:profile` scope. A credential created by `claude setup-token` only carries
+  `user:inference`, so sign in to Claude Code with `/login` instead; the new
+  Keychain entry has both scopes. Editing the entry in Keychain Access does not
+  help — the scope is baked into the token by the server, and the `scopes` array
+  stored next to it is only a label. The exact scopes on the stored token are
+  logged next to any HTTP error (`log show --predicate 'process == "CCJuice"'`).
+  After signing in again, use **Refresh** to re-check immediately.
+- **An error sticks around after you fixed it** — after a failure the app backs
+  off before retrying. **Refresh** overrides that wait. The one exception is
+  a rate limit, which has to be waited out.
 - **swiftc fails with "redefinition of module 'SwiftBridging'"** — a known bug
   in some Command Line Tools releases. `build.sh` detects and works around it
   automatically with a compiler VFS overlay (no sudo, no system files touched).
