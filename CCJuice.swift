@@ -6,8 +6,10 @@ import UserNotifications
 struct Bucket {
     let utilization: Double
     let resetsAt: Date?
-    var remaining: Int { max(0, Int((100 - utilization).rounded())) }
-    var used: Int { min(100, max(0, Int(utilization.rounded()))) }
+    var remaining: Int { min(100, max(0, Int((100 - utilization).rounded()))) }
+    // Defined via `remaining`, not rounded independently — the two must sum to 100
+    // or toggling the display mode shows numbers that contradict each other.
+    var used: Int { 100 - remaining }
 }
 
 // Built once: formatter construction is expensive and these are parsed on every poll.
@@ -71,8 +73,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     private enum ValueMode: String {
         case remaining, used
         func value(_ bucket: Bucket) -> Int { self == .used ? bucket.used : bucket.remaining }
+        func text(_ bucket: Bucket) -> String { "\(value(bucket))% \(suffix)" }
         var suffix: String { self == .used ? "used" : "left" }
         var noun: String { self == .used ? "used" : "remaining" }
+    }
+
+    /// A hold on polling: until when, why, and whether the server imposed it.
+    /// One value — persisted, replaced, and cleared as a unit — so the three
+    /// facts can never drift apart.
+    private struct Pause: Codable {
+        let until: Date
+        let reason: String
+        // A rate-limit pause is the server's instruction and nothing local may
+        // lift it. Every other pause is for a cause the user can fix — a re-login,
+        // mostly — so an explicit refresh is let through.
+        let isRateLimit: Bool
+
+        static func load() -> Pause? {
+            UserDefaults.standard.data(forKey: Key.pause)
+                .flatMap { try? JSONDecoder().decode(Pause.self, from: $0) }
+        }
+
+        static func store(_ pause: Pause?) {
+            UserDefaults.standard.set(
+                pause.flatMap { try? JSONEncoder().encode($0) }, forKey: Key.pause)
+        }
     }
 
     // Every persisted key in one place: property initialisers cannot see instance
@@ -83,9 +108,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         static let displayMode = "displayMode"
         static let valueMode = "valueMode"
         static let lowThreshold = "lowThreshold"
-        static let blockedUntil = "blockedUntil"
-        static let blockedIsRateLimit = "blockedIsRateLimit"
-        static let blockedReason = "blockedReason"
+        static let pause = "pause"
     }
 
     private let resetNotificationID = "session-reset"
@@ -100,29 +123,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
     // The usage endpoint rate-limits per token, so requests are throttled: at most
     // one in flight, no sooner than `minimumInterval` after the last one, and after
-    // a 429 nothing goes out until `blockedUntil`.
+    // a 429 nothing goes out until the pause expires.
     private let minimumInterval: TimeInterval = 60
     private var lastRequestAt: Date?
     private var isFetching = false
-    // Survives a relaunch so restarting the app cannot probe into a live rate limit.
-    private var blockedUntil: Date? = UserDefaults.standard.object(forKey: Key.blockedUntil) as? Date {
-        didSet { UserDefaults.standard.set(blockedUntil, forKey: Key.blockedUntil) }
+    // Survives a relaunch so restarting the app cannot probe into a live rate
+    // limit — and cannot downgrade it into a bypassable pause, since the whole
+    // pause (including `isRateLimit`) is stored together.
+    private var activePause: Pause? = Pause.load() {
+        didSet { Pause.store(activePause) }
     }
     private var backoffStep: TimeInterval = 0
     private let backoffSteps: [TimeInterval] = [120, 300, 900, 1800]
-    // Persisted too, so a pause that outlives a relaunch still says what caused it.
-    private var blockedReason = UserDefaults.standard.string(forKey: Key.blockedReason)
-        ?? "Paused after an error"
-    {
-        didSet { UserDefaults.standard.set(blockedReason, forKey: Key.blockedReason) }
-    }
-    // A rate-limit pause is the server's instruction and nothing local may lift it.
-    // Every other pause is for a cause the user can fix — a re-login, mostly — so an
-    // explicit refresh is let through. Persisted alongside `blockedUntil` so that a
-    // relaunch cannot downgrade a live rate limit into a bypassable pause.
-    private var blockedIsRateLimit = UserDefaults.standard.bool(forKey: Key.blockedIsRateLimit) {
-        didSet { UserDefaults.standard.set(blockedIsRateLimit, forKey: Key.blockedIsRateLimit) }
-    }
     private var tokenScopes: [String] = []
 
     private var session: Bucket?
@@ -263,46 +275,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             UNUserNotificationCenter.current().delegate = self
         }
 
-        // The timer does not fire while the Mac sleeps, so top up on wake. Not the
-        // forcing variant: waking the lid is not the user asking us to retry, and it
-        // must not walk past a backoff that is still running.
+        // The timer does not fire while the Mac sleeps, so top up on wake.
         NSWorkspace.shared.notificationCenter.addObserver(
-            self, selector: #selector(refresh as () -> Void),
+            self, selector: #selector(refreshAfterWake),
             name: NSWorkspace.didWakeNotification, object: nil)
 
-        refresh()
+        refresh(force: false)
         timer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
-            self?.refresh()
+            self?.refresh(force: false)
         }
+        // The poll has no deadline; let macOS coalesce the wakeup with others.
+        timer?.tolerance = 30
     }
 
     func menuWillOpen(_ menu: NSMenu) {
         renderMenuLines()  // recompute countdowns
         // Opening the menu must not cost a request on its own; the timer keeps the
         // numbers fresh. Only top up if they have gone stale.
-        refresh()
+        refresh(force: false)
     }
 
     // MARK: - Data
 
     /// Menu item action: the user asking explicitly lifts a pause we imposed
     /// ourselves, but still has to wait out a 429.
-    @objc func refreshNow() {
+    @objc private func refreshNow() {
         refresh(force: true)
     }
 
-    @objc func refresh() {
+    /// Wake handler. Not forcing: waking the lid is not the user asking us to
+    /// retry, and it must not walk past a backoff that is still running.
+    @objc private func refreshAfterWake() {
         refresh(force: false)
     }
 
     private func refresh(force: Bool) {
         if isFetching { return }
-        // An explicit refresh clears a pause of our own making: the user has most
-        // likely just fixed the cause and is asking us to re-check. A rate limit is
-        // the server's call and stands regardless of who is asking.
-        let mayBypassPause = force && !blockedIsRateLimit
-        if let blockedUntil, Date() < blockedUntil, !mayBypassPause {
-            showPaused(until: blockedUntil)
+        // A rate limit is the server's call and stands for everyone. Any other
+        // pause is of our own making and an explicit refresh lifts it: the user
+        // has most likely just fixed the cause and is asking us to re-check.
+        if let activePause, Date() < activePause.until, !force || activePause.isRateLimit {
+            showPaused(activePause)
             return
         }
         if !force, let lastRequestAt, Date().timeIntervalSince(lastRequestAt) < minimumInterval {
@@ -345,6 +358,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     private func handle(data: Data?, resp: URLResponse?, err: Error?) {
         isFetching = false
         if let err = err {
+            // Transport errors (offline, DNS) deliberately skip the backoff ladder:
+            // the request never reached the server, and they usually clear on their
+            // own — the next timer tick simply tries again.
             show(error: err.localizedDescription)
             return
         }
@@ -368,7 +384,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         }
         if status == 429 {
             // Honour Retry-After when the server sends one, otherwise back off in
-            // steps so a rate limit is not made worse by retrying into it.
+            // steps so a rate limit is not made worse by retrying into it. Only the
+            // delta-seconds form is parsed; the HTTP-date form comes out nil and
+            // falls back to the ladder.
             let retryAfter = (http?.value(forHTTPHeaderField: "Retry-After"))
                 .flatMap { TimeInterval($0.trimmingCharacters(in: .whitespaces)) }
             // Escalate the step on every 429, then wait for whichever is longer:
@@ -397,8 +415,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
               week.map { "\($0.remaining)%" } ?? "-",
               opus.map { "\($0.remaining)%" } ?? "-")
         backoffStep = 0
-        blockedUntil = nil
-        blockedIsRateLimit = false
+        activePause = nil
         self.session = session
         self.week = week
         self.opus = opus
@@ -507,7 +524,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
     private func line(label: String, bucket: Bucket?) -> String {
         guard let b = bucket else { return "\(label): no data" }
-        var s = "\(label): \(valueMode.value(b))% \(valueMode.suffix)"
+        var s = "\(label): \(valueMode.text(b))"
         if let r = b.resetsAt {
             s += " — resets in \(countdown(to: r)) (\(resetFormatter.string(from: r)))"
         }
@@ -517,10 +534,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     /// Stop calling the endpoint until `until`, and say why. None of these failures
     /// say anything about the plan quota, so the last known percentages stay up.
     private func pause(_ reason: String, until: Date, rateLimit: Bool = false) {
-        blockedUntil = until
-        blockedReason = reason
-        blockedIsRateLimit = rateLimit
-        showPaused(until: until)
+        let p = Pause(until: until, reason: reason, isRateLimit: rateLimit)
+        activePause = p
+        showPaused(p)
     }
 
     /// Escalating pause for failures the server gave no retry hint for.
@@ -535,8 +551,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         return backoffStep
     }
 
-    private func showPaused(until: Date) {
-        show(error: "\(blockedReason) — retrying in \(countdown(to: until))")
+    private func showPaused(_ p: Pause) {
+        show(error: "\(p.reason) — retrying in \(countdown(to: p.until))")
     }
 
     private func show(error: String) {
@@ -664,7 +680,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             guard lowThresholds.contains(where: { previous > $0 && b.remaining <= $0 })
             else { continue }
             let name = label == "S" ? "Session" : label == "W" ? "Week" : "Week (Opus)"
-            var body = "\(name): \(valueMode.value(b))% \(valueMode.suffix)"
+            var body = "\(name): \(valueMode.text(b))"
             if let r = b.resetsAt { body += " — resets in \(countdown(to: r))" }
             sendNotification(title: "Claude usage running low", body: body)
         }
