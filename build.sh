@@ -39,8 +39,23 @@ cp Info.plist "$APP/Contents/"
 cp AppIcon.icns "$APP/Contents/Resources/"
 mv CCJuice "$APP/Contents/MacOS/"
 
-# Ad-hoc signature so the Keychain "Always Allow" choice persists across launches
-codesign --force -s - "$APP"
+# Ad-hoc signature by default, plus the hardened runtime. The app holds an OAuth
+# bearer token in memory, and the hardened runtime is what stops another process
+# running as the same user from attaching a debugger to it or injecting a library
+# through DYLD_INSERT_LIBRARIES to read that token back out. The app needs no
+# entitlement exceptions — it links only system frameworks.
+#
+# An ad-hoc signature changes with every build, and macOS ties the Keychain
+# "Always Allow" grant to it, so the consent dialog returns after a rebuild. If
+# you already have a code-signing identity (an Apple Development certificate from
+# Xcode, for example), sign with it instead and the grant survives rebuilds:
+#
+#   CODESIGN_IDENTITY="Apple Development" ./build.sh
+#
+# The script itself never creates or installs certificates — putting a signing
+# certificate into your trust store is a much larger ask than clicking Allow.
+codesign --force --options runtime -s "${CODESIGN_IDENTITY:--}" "$APP"
+codesign --verify --strict "$APP"
 
 echo "Built: $PWD/$APP"
 echo "Launch with: open $APP"

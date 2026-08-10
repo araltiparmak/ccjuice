@@ -51,28 +51,60 @@ brew install --HEAD araltiparmak/ccjuice/ccjuice
 open "$(brew --prefix)/opt/ccjuice/CCJuice.app"
 ```
 
-On first launch macOS asks for permission to read the Claude Code credential
-from your Keychain — choose **Always Allow** so it doesn't ask again. Enabling
-notifications triggers the standard notification permission prompt once.
-
 ## How it works — security & privacy
 
 Usage percentages are not persisted on disk by Claude Code, so the app makes a
 single kind of external call:
 
 1. Reads your OAuth token from the `Claude Code-credentials` entry in the macOS
-   Keychain (the same credential Claude Code itself uses). The Keychain prompt
-   you approve is macOS enforcing access to that entry — the app never sees
-   your password.
+   Keychain (the same credential Claude Code itself uses) via
+   `SecItemCopyMatching`. macOS decides whether to ask — usually a consent dialog
+   on the first read, where **Always Allow** stops it asking again. The app never
+   sees your login password.
 2. Calls `https://api.anthropic.com/api/oauth/usage` with that token and shows
    the returned `five_hour` / `seven_day` / `seven_day_opus` utilization.
 
 Nothing else is read, stored, or sent anywhere. It's a few hundred lines of
-Swift — read `CCJuice.swift` and verify.
+Swift — read `CCJuice.swift` and verify. What that code deliberately does *not*
+do is worth stating too, because a usage meter has no business doing any of it:
+
+- **It does not route around the Keychain prompt.** The same secret can be read
+  with no dialog at all by shelling out to `/usr/bin/security`, which already
+  sits inside the credential's access partition. CCJuice does not do that. An
+  app that quietly helps itself to another app's OAuth token is
+  indistinguishable from one that steals it, and the dialog is your chance to
+  say no. If you decline, the app backs off instead of re-asking on a timer.
+- **It does not log your token, or anything a token could hide in.** Error
+  responses are server-controlled text and the unified log is readable by
+  anything else running as you, so only the server's short error tag
+  (`rate_limit_error`) and your token's scope *names* are logged — never a
+  response body, never the token, and on success nothing at all.
+- **It does not cache anything to disk.** The HTTP session is ephemeral: no URL
+  cache, no cookie jar, no shared credential store, so a response fetched with a
+  bearer token never lands in `~/Library/Caches`.
+- **It does not ask you to weaken your machine.** No trusted certificate to
+  install, no sudo, no login item beyond the standard `SMAppService` toggle. The
+  app is signed with the hardened runtime, which is what stops another process
+  running as you from attaching a debugger or injecting a library to read the
+  token out of its memory.
+- **It talks to exactly one host,** `api.anthropic.com`, over TLS. There is no
+  telemetry, no analytics, and no update check.
 
 ## Troubleshooting
 
 - **`CC ⚠︎` in the menu bar** — open the menu; the error is on the first line.
+- **Keychain keeps asking** — choose **Always Allow** rather than Allow, and
+  macOS remembers the grant. It ties that grant to the app's signature, so the
+  question comes back once after a rebuild or a `brew upgrade`. If you rebuild
+  often and already have a code-signing identity (`security find-identity -v -p
+  codesigning`), build with `CODESIGN_IDENTITY="Apple Development" ./build.sh` —
+  a stable signature keeps the grant across rebuilds. The script never creates
+  or installs certificates; it only uses one you already have.
+- **"Keychain access denied"** — you declined the prompt, so the app stopped
+  asking rather than reopening the dialog every five minutes. **Refresh** asks
+  again when you're ready.
+- **"No Claude Code credential in the Keychain"** — sign in to Claude Code on
+  this machine first; CCJuice reads the entry Claude Code creates.
 - **"Token expired"** — run Claude Code once; it refreshes the token.
 - **"Token lacks the user:profile scope"** — the usage endpoint requires the
   `user:profile` scope. A credential created by `claude setup-token` only carries
@@ -85,11 +117,45 @@ Swift — read `CCJuice.swift` and verify.
 - **An error sticks around after you fixed it** — after a failure the app backs
   off before retrying. **Refresh** overrides that wait. The one exception is
   a rate limit, which has to be waited out.
+- **You ran an old `make-signing-cert.sh`** — that script is gone, but deleting
+  it does not undo what it did on a machine that ran it. It left a passphrase-free
+  self-signed certificate in your login keychain, marked *trusted for code
+  signing*, whose private key `codesign` may use without asking. Anything running
+  as you could sign code with it. Remove it:
+
+  ```bash
+  security delete-identity -c ccjuice-codesign ~/Library/Keychains/login.keychain-db
+  ```
+
+  Then open **Keychain Access → login → Certificates**, and if a
+  `ccjuice-codesign` entry remains, delete it there too.
 - **swiftc fails with "redefinition of module 'SwiftBridging'"** — a known bug
   in some Command Line Tools releases. `build.sh` detects and works around it
   automatically with a compiler VFS overlay (no sudo, no system files touched).
 - **Generic icon in notifications** — macOS caches app icons; it refreshes
   after a re-login or shortly by itself.
+
+## Uninstall
+
+Quit CCJuice (menu → **Quit**) and turn **Start at Login** off if you enabled
+it, then:
+
+```bash
+brew uninstall ccjuice && brew untap araltiparmak/ccjuice   # Homebrew install
+rm -rf CCJuice.app                                          # source build — delete the app wherever you put it
+defaults delete app.ccjuice                                 # stored preferences (optional)
+```
+
+The app leaves nothing else behind. The Keychain **Always Allow** grant lives
+on Claude Code's own credential entry, not in the app; to revoke it, open
+Keychain Access, find `Claude Code-credentials`, and remove CCJuice under
+**Access Control**.
+
+## Contributing
+
+Issues and PRs welcome. The constraint that matters: it stays **one Swift file
+with zero dependencies** — small enough that anyone can read all of it before
+trusting it with a Keychain entry.
 
 ## Regenerating the icon
 

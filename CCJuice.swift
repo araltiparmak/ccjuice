@@ -47,11 +47,99 @@ func describeStructure(_ any: Any, depth: Int = 0) -> String {
     case let num as NSNumber:
         return "\(num)"
     case let str as String:
-        return str.count > 40 ? "string(\(str.count) chars)" : "\"\(str)\""
+        // Lengths, never contents. This runs on payloads we did not expect, which
+        // is precisely where a value worth keeping out of the log could turn up.
+        return "string(\(str.count) chars)"
     case is NSNull:
         return "null"
     default:
         return "\(type(of: any))"
+    }
+}
+
+/// An error response, split into the part that may be logged and the part that
+/// may not.
+struct APIError {
+    /// The server's short, enum-like tag — "rate_limit_error" and the like. Safe
+    /// to log, and capped in case a future one is not so short.
+    let type: String
+
+    /// The body verbatim, kept only for the local checks below. It is never
+    /// logged, shown, or persisted: this is server-controlled text, and the
+    /// unified log is readable by anything else running as this user.
+    private let raw: String
+
+    init(_ data: Data?) {
+        let json = data.flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any]
+        let error = json?["error"] as? [String: Any]
+        type = (error?["type"] as? String).map { String($0.prefix(64)) } ?? "no error type"
+        raw = data.flatMap { String(data: $0.prefix(4096), encoding: .utf8) } ?? ""
+    }
+
+    /// The usage endpoint turns away an under-scoped token with a message naming
+    /// the requirement; nothing else in the response separates that case from an
+    /// ordinary expired token.
+    var isScopeRejection: Bool { raw.localizedCaseInsensitiveContains("scope") }
+}
+
+/// The Claude Code OAuth credential. Read from the Keychain each time it is
+/// needed and never cached in a property, written to disk, or logged.
+struct Credential {
+    let token: String
+    let scopes: [String]
+
+    enum Failure: Error {
+        case denied
+        case missing
+        case malformed
+        case keychain(OSStatus)
+
+        var message: String {
+            switch self {
+            case .denied:
+                return "Keychain access not granted — choose Always Allow when macOS asks"
+            case .missing:
+                return "No Claude Code credential in the Keychain — sign in to Claude Code first"
+            case .malformed:
+                return "Claude Code credential is not in the expected format"
+            case .keychain(let status):
+                return "Keychain error \(status)"
+            }
+        }
+    }
+
+    /// Reads through the Security framework — the only path that goes through
+    /// macOS's own consent check, so the first read puts the standard Keychain
+    /// dialog on screen and the user decides. The same secret can be had without
+    /// that dialog by shelling out to `/usr/bin/security`, which already sits
+    /// inside the item's access partition, but an app that quietly helps itself
+    /// to another app's credential is indistinguishable from one that steals it.
+    /// The prompt is the feature, not an obstacle to route around.
+    static func read() -> Result<Credential, Failure> {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "Claude Code-credentials",
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        switch status {
+        case errSecSuccess:
+            break
+        case errSecItemNotFound:
+            return .failure(.missing)
+        case errSecUserCanceled, errSecAuthFailed, errSecInteractionNotAllowed:
+            return .failure(.denied)
+        default:
+            return .failure(.keychain(status))
+        }
+        guard let data = item as? Data,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let oauth = json["claudeAiOauth"] as? [String: Any],
+              let token = oauth["accessToken"] as? String
+        else { return .failure(.malformed) }
+        return .success(Credential(token: token, scopes: (oauth["scopes"] as? [String]) ?? []))
     }
 }
 
@@ -120,6 +208,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
     private var statusItem: NSStatusItem!
     private var timer: Timer?
+
+    // The one and only host this app talks to.
+    private static let usageEndpoint = URL(string: "https://api.anthropic.com/api/oauth/usage")!
+
+    // Ephemeral: no on-disk cache, no cookie jar, no shared credential store, so a
+    // response fetched with a bearer token is never written under ~/Library/Caches
+    // and nothing about this session outlives the process.
+    private let urlSession: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        config.urlCache = nil
+        config.httpCookieStorage = nil
+        config.httpShouldSetCookies = false
+        config.httpCookieAcceptPolicy = .never
+        config.timeoutIntervalForRequest = 20
+        config.timeoutIntervalForResource = 30
+        config.httpAdditionalHeaders = ["Accept": "application/json"]
+        return URLSession(configuration: config)
+    }()
+
+    // The usage payload is a few hundred bytes. Anything past this is not it, and
+    // is refused rather than handed to the JSON parser.
+    private let maxResponseBytes = 64 * 1024
 
     // The usage endpoint rate-limits per token, so requests are throttled: at most
     // one in flight, no sooner than `minimumInterval` after the last one, and after
@@ -321,38 +432,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         if !force, let lastRequestAt, Date().timeIntervalSince(lastRequestAt) < minimumInterval {
             return
         }
-        guard let token = readAccessToken() else {
-            show(error: "Could not read token from Keychain")
-            return
-        }
         isFetching = true
         lastRequestAt = Date()
-        var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
-        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
-        URLSession.shared.dataTask(with: req) { [weak self] data, resp, err in
-            DispatchQueue.main.async { self?.handle(data: data, resp: resp, err: err) }
-        }.resume()
+        // The Keychain read can put a consent dialog on screen, and that blocks
+        // whichever thread asked for the item until the user answers — never the
+        // main thread, or the menu freezes behind its own prompt.
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = Credential.read()
+            DispatchQueue.main.async { self?.send(result) }
+        }
     }
 
-    private func readAccessToken() -> String? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "Claude Code-credentials",
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        var item: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data,
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let oauth = json["claudeAiOauth"] as? [String: Any],
-              let token = oauth["accessToken"] as? String
-        else { return nil }
-        // Scope names only — never the token itself. The usage endpoint rejects
-        // tokens without `user:profile`, and that is worth being able to see.
-        tokenScopes = (oauth["scopes"] as? [String]) ?? []
-        return token
+    /// Sends the usage request with a freshly read credential, or reports why the
+    /// credential could not be read.
+    private func send(_ result: Result<Credential, Credential.Failure>) {
+        let credential: Credential
+        switch result {
+        case .success(let value):
+            credential = value
+        case .failure(let failure):
+            isFetching = false
+            // Back off rather than retry on the next tick. If the user said no to
+            // the Keychain dialog, a five-minute poll would reopen it forever —
+            // and an app that nags until you click Allow has taken the choice away.
+            // **Refresh** lifts this pause once they have decided otherwise.
+            pause(failure.message)
+            return
+        }
+        // Scope names only — the token itself never leaves this method. The usage
+        // endpoint rejects tokens without `user:profile`, and that is worth seeing.
+        tokenScopes = credential.scopes
+
+        var req = URLRequest(url: Self.usageEndpoint)
+        req.setValue("Bearer \(credential.token)", forHTTPHeaderField: "Authorization")
+        req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+        urlSession.dataTask(with: req) { [weak self] data, resp, err in
+            DispatchQueue.main.async { self?.handle(data: data, resp: resp, err: err) }
+        }.resume()
     }
 
     private func handle(data: Data?, resp: URLResponse?, err: Error?) {
@@ -366,21 +482,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         }
         let http = resp as? HTTPURLResponse
         let status = http?.statusCode ?? 0
-        // Error bodies carry the server's own explanation and no credentials.
-        let body = data.flatMap { String(data: $0.prefix(400), encoding: .utf8) } ?? ""
-        if status != 200 && status != 429 {
-            NSLog("CCJuice HTTP %ld (token scopes: %@) — %@",
-                  status, tokenScopes.joined(separator: " "), body)
-        }
-        if status == 403, body.contains("scope requirement") {
-            // The stored credential is valid but was minted without the scope this
-            // endpoint needs — only a fresh sign-in changes that, not a token refresh.
-            pause("Token lacks the user:profile scope — sign in to Claude Code again")
+        if let data, data.count > maxResponseBytes {
+            pause("Response too large (HTTP \(status))")
             return
         }
         if status == 401 || status == 403 {
-            pause("Not authorized (HTTP \(status)) — run Claude Code to refresh the token")
+            // Only the server's short tag is logged. The body itself is inspected
+            // here and then dropped: it goes nowhere near the system log.
+            let apiError = APIError(data)
+            NSLog("CCJuice HTTP %ld (%@) — token scopes: %@",
+                  status, apiError.type, tokenScopes.joined(separator: " "))
+            if status == 403, apiError.isScopeRejection {
+                // The stored credential is valid but was minted without the scope
+                // this endpoint needs — only a fresh sign-in changes that, not a
+                // token refresh.
+                pause("Token lacks the user:profile scope — sign in to Claude Code again")
+            } else {
+                pause("Not authorized (HTTP \(status)) — run Claude Code to refresh the token")
+            }
             return
+        }
+        if status != 200 && status != 429 {
+            NSLog("CCJuice HTTP %ld (%@)", status, APIError(data).type)
         }
         if status == 429 {
             // Honour Retry-After when the server sends one, otherwise back off in
@@ -392,7 +515,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             // Escalate the step on every 429, then wait for whichever is longer:
             // our own step or what the server asked for.
             let until = Date().addingTimeInterval(max(retryAfter ?? 0, escalateBackoff()))
-            NSLog("CCJuice rate limited until %@ — %@", "\(until)", body)
+            NSLog("CCJuice rate limited until %@", "\(until)")
             pause("Usage API rate limited", until: until, rateLimit: true)
             return
         }
@@ -410,10 +533,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             pause("Unexpected response (HTTP \(status))")
             return
         }
-        NSLog("CCJuice updated: session=%@ week=%@ opus=%@",
-              session.map { "\($0.remaining)%" } ?? "-",
-              week.map { "\($0.remaining)%" } ?? "-",
-              opus.map { "\($0.remaining)%" } ?? "-")
+        // Nothing is logged on success: the percentages are the user's own usage
+        // data, the menu already shows them, and the unified log is readable by
+        // anything else running as this user.
         backoffStep = 0
         activePause = nil
         self.session = session

@@ -29,8 +29,10 @@ class Ccjuice < Formula
       Or copy it to /Applications:
         cp -r #{opt_prefix}/CCJuice.app /Applications/
 
-      On first launch macOS will ask for Keychain access to the Claude Code
-      credential — choose "Always Allow".
+      On first launch macOS asks whether CCJuice may read the Claude Code
+      credential from your Keychain. Choose "Always Allow" to be asked once.
+      The app is signed ad-hoc, and macOS ties that grant to the signature, so
+      the question comes back after a `brew upgrade` rebuilds the app.
     EOS
   end
 
