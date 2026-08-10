@@ -1,18 +1,18 @@
 # Homebrew formula. Tap this repo directly:
 #   brew tap <user>/ccjuice https://github.com/<user>/ccjuice
-#   brew install --HEAD <user>/ccjuice/ccjuice
+#   brew install <user>/ccjuice/ccjuice          # latest release
+#   brew install --HEAD <user>/ccjuice/ccjuice   # current main
 #
-# For stable releases: tag a version (e.g. v1.0.0) — the release workflow prints the
-# exact `url` and `sha256` lines in the GitHub release notes; paste them below and
-# drop the --HEAD flag.
+# For a new release: tag a version — the release workflow prints the exact
+# `url` and `sha256` lines in the GitHub release notes; update them below.
 class Ccjuice < Formula
   desc "MacOS menu bar app showing remaining Claude Code usage percentages"
   homepage "https://github.com/araltiparmak/ccjuice"
   license "MIT"
   head "https://github.com/araltiparmak/ccjuice.git", branch: "main"
 
-  # url "https://github.com/araltiparmak/ccjuice/archive/refs/tags/v1.0.0.tar.gz"
-  # sha256 "FILL_ME_IN"
+  url "https://github.com/araltiparmak/ccjuice/archive/refs/tags/v1.0.0.tar.gz"
+  sha256 "712a504e3fec41680339c2022e3ecf83bdd83087301c7c673ecf1b2fdae3e016"
 
   depends_on :macos
 

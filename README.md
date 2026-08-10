@@ -47,7 +47,7 @@ open CCJuice.app
 
 ```bash
 brew tap araltiparmak/ccjuice https://github.com/araltiparmak/ccjuice
-brew install --HEAD araltiparmak/ccjuice/ccjuice
+brew install araltiparmak/ccjuice/ccjuice
 open "$(brew --prefix)/opt/ccjuice/CCJuice.app"
 ```
 
