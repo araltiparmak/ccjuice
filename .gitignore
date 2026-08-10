@@ -13,3 +13,6 @@ icon-1024.png
 # IDE
 .idea/
 .vscode/
+
+# Local agent tooling (machine-specific notes, never for the repo)
+.serena/
